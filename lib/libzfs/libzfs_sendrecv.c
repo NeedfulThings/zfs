@@ -91,6 +91,7 @@ typedef struct progress_arg {
 	zfs_handle_t *pa_zhp;
 	int pa_fd;
 	boolean_t pa_parsable;
+	boolean_t pa_progress;
 } progress_arg_t;
 
 typedef struct dataref {
@@ -1189,6 +1190,13 @@ gather_holds(zfs_handle_t *zhp, send_dump_data_t *sdd)
 	fnvlist_add_string(sdd->snapholds, zhp->zfs_name, sdd->holdtag);
 }
 
+static volatile sig_atomic_t send_progress_thread_signal = 0;
+/* ARGSUSED */
+static void send_progress_thread_sig(int signo)
+{
+	send_progress_thread_signal = 1;
+}
+
 static void *
 send_progress_thread(void *arg)
 {
@@ -1201,16 +1209,38 @@ send_progress_thread(void *arg)
 	time_t t;
 	struct tm *tm;
 
+	struct sigaction action;
+	action.sa_handler = send_progress_thread_sig;
+	sigemptyset(&action.sa_mask);
+	action.sa_flags = 0;
+	(void) sigaction(SIGINFO, &action, NULL);
+	/* Enable this thread to receive SIGINFO signal */
+	sigset_t sigset;
+	sigemptyset(&sigset);
+	sigaddset(&sigset, SIGINFO);
+	pthread_sigmask(SIG_UNBLOCK, &sigset, NULL);
+
 	(void) strlcpy(zc.zc_name, zhp->zfs_name, sizeof (zc.zc_name));
 
-	if (!pa->pa_parsable)
+	if (!pa->pa_parsable && pa->pa_progress)
 		(void) fprintf(stderr, "TIME        SENT   SNAPSHOT\n");
 
 	/*
 	 * Print the progress from ZFS_IOC_SEND_PROGRESS every second.
 	 */
 	for (;;) {
-		(void) sleep(1);
+
+		/*
+		 * If we are doing 'send -v' sleep for 1 second, otherwise
+		 * sleep forever, until signal or quitting.
+		 */
+		if (!pa->pa_progress) {
+			while(send_progress_thread_signal == 0)
+				(void) sleep(1);
+			send_progress_thread_signal = 0;
+		} else {
+			(void) sleep(1);
+		}
 
 		zc.zc_cookie = pa->pa_fd;
 		if (zfs_ioctl(hdl, ZFS_IOC_SEND_PROGRESS, &zc) != 0)
@@ -1381,28 +1411,31 @@ dump_snapshot(zfs_handle_t *zhp, void *arg)
 
 	if (!sdd->dryrun) {
 		/*
-		 * If progress reporting is requested, spawn a new thread to
-		 * poll ZFS_IOC_SEND_PROGRESS at a regular interval.
+		 * Spawn a new thread to poll ZFS_IOC_SEND_PROGRESS at a regular
+		 * interval, or upon receiving SIGINFO signal.
 		 */
-		if (sdd->progress) {
-			pa.pa_zhp = zhp;
-			pa.pa_fd = sdd->outfd;
-			pa.pa_parsable = sdd->parsable;
+		pa.pa_zhp = zhp;
+		pa.pa_fd = sdd->outfd;
+		pa.pa_parsable = sdd->parsable;
+		pa.pa_progress = sdd->progress;
 
-			if ((err = pthread_create(&tid, NULL,
+		/* Make sure this thread ignores signal, or ioctl aborts */
+		sigset_t sigset;
+		sigemptyset(&sigset);
+		sigaddset(&sigset, SIGINFO);
+		pthread_sigmask(SIG_BLOCK, &sigset, NULL);
+
+		if ((err = pthread_create(&tid, NULL,
 			    send_progress_thread, &pa))) {
-				zfs_close(zhp);
-				return (err);
-			}
+			zfs_close(zhp);
+			return (err);
 		}
 
 		err = dump_ioctl(zhp, sdd->prevsnap, sdd->prevsnap_obj,
 		    fromorigin, sdd->outfd, flags, sdd->debugnv);
 
-		if (sdd->progress) {
-			(void) pthread_cancel(tid);
-			(void) pthread_join(tid, NULL);
-		}
+		(void) pthread_cancel(tid);
+		(void) pthread_join(tid, NULL);
 	}
 
 	(void) strcpy(sdd->prevsnap, thissnap);
@@ -1757,26 +1790,29 @@ zfs_send_resume(libzfs_handle_t *hdl, sendflags_t *flags, int outfd,
 		 * If progress reporting is requested, spawn a new thread to
 		 * poll ZFS_IOC_SEND_PROGRESS at a regular interval.
 		 */
-		if (flags->progress) {
-			pa.pa_zhp = zhp;
-			pa.pa_fd = outfd;
-			pa.pa_parsable = flags->parsable;
+		pa.pa_zhp = zhp;
+		pa.pa_fd = outfd;
+		pa.pa_parsable = flags->parsable;
+		pa.pa_progress = flags->progress;
 
-			error = pthread_create(&tid, NULL,
-			    send_progress_thread, &pa);
-			if (error != 0) {
-				zfs_close(zhp);
-				return (error);
-			}
+		/* Make sure this thread ignores signal, or ioctl aborts */
+		sigset_t sigset;
+		sigemptyset(&sigset);
+		sigaddset(&sigset, SIGINFO);
+		pthread_sigmask(SIG_BLOCK, &sigset, NULL);
+
+		error = pthread_create(&tid, NULL,
+		    send_progress_thread, &pa);
+		if (error != 0) {
+			zfs_close(zhp);
+			return (error);
 		}
 
 		error = lzc_send_resume(zhp->zfs_name, fromname, outfd,
 		    lzc_flags, resumeobj, resumeoff);
 
-		if (flags->progress) {
-			(void) pthread_cancel(tid);
-			(void) pthread_join(tid, NULL);
-		}
+		(void) pthread_cancel(tid);
+		(void) pthread_join(tid, NULL);
 
 		char errbuf[1024];
 		(void) snprintf(errbuf, sizeof (errbuf), dgettext(TEXT_DOMAIN,
